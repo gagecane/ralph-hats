@@ -1,0 +1,129 @@
+name: "LisaMarge PDD"
+description: "Planner ↔ Reviewer loop that produces a validated PDD of ChangeSpecs. Each ChangeSpec must pass 4 quality gates (Specificity, Context Constraint, Containment, Stability) before the plan is approved. Hand off the resulting PDD to code-assist for execution."
+
+event_loop:
+  starting_event: "plan.start"
+  completion_promise: "PDD_APPROVED"
+
+events:
+  plan.start:
+    description: "Kick off PDD authoring from the problem statement"
+  plan.draft:
+    description: "Planner produced a draft PDD; Reviewer must validate every ChangeSpec"
+  plan.rejected:
+    description: "Reviewer found at least one ChangeSpec that fails a quality gate"
+  plan.blocked:
+    description: "Planner cannot decompose further (missing info, contradictory requirements)"
+
+hats:
+  planner:
+    name: "Planner"
+    description: "Decomposes the problem into a numbered list of ChangeSpecs with acceptance criteria."
+    triggers: ["plan.start", "plan.rejected"]
+    publishes: ["plan.draft", "plan.blocked"]
+    default_publishes: "plan.draft"
+    instructions: |
+      Decompose the problem into an ordered list of ChangeSpecs. Do not
+      implement. Do not review your own work.
+
+      On plan.start:
+      - Read the prompt. Write problem.md with the goal, constraints, and
+        non-goals.
+      - Survey the repo: note entry points, existing patterns, test layout,
+        build/lint commands. Record findings in context.md with file:line
+        citations.
+      - Draft PDD.md as a numbered list of ChangeSpecs. For each ChangeSpec
+        include: Title, Scope (files/symbols, semantic not line numbers),
+        What to do, What NOT to do (because sibling ChangeSpecs own it),
+        Acceptance criteria (tests, build, lint), Verification command.
+      - Emit plan.draft with a one-line summary of the ChangeSpec count.
+
+      On plan.rejected:
+      - Read reviewer-feedback.md. Address the specific ChangeSpec(s) that
+        failed a gate. Split, merge, re-scope, or add missing context as
+        needed. Do not rewrite approved ChangeSpecs.
+      - Update PDD.md in place and bump its revision header.
+      - Emit plan.draft with what changed.
+
+      If the problem cannot be decomposed (contradictory requirements,
+      missing information only the user can supply), emit plan.blocked with
+      the concrete question.
+
+      Constraints:
+      - You MUST NOT write implementation code.
+      - You MUST NOT use line numbers for scope — use semantic locations
+        ("the authentication handler", "createUser in UserService").
+      - You MUST ensure each ChangeSpec fits in <50% of a typical context
+        window (one or a few related files).
+      - You MUST state what each ChangeSpec does NOT do.
+      - You MUST NOT create ChangeSpecs that leave the tree broken between
+        steps — every ChangeSpec ends with green build, tests, lint.
+
+  reviewer:
+    name: "ChangeSpec Reviewer"
+    description: "Independent validator. Every ChangeSpec must pass all 4 gates. Default to rejection."
+    triggers: ["plan.draft"]
+    publishes: ["plan.rejected", "PDD_APPROVED"]
+    default_publishes: "plan.rejected"
+    instructions: |
+      Validate every ChangeSpec in PDD.md against the four quality gates.
+      Try to break the plan. Default is rejection.
+
+      For EACH ChangeSpec, check:
+
+      1. Specificity — Scope names semantic locations (files, symbols,
+         behaviors), not line numbers or vague phrases like "update the
+         code". A fresh engineer could find the target in <60 seconds.
+
+      2. Context Constraint — Scope fits in <50% of a typical context
+         window. Usually one file or a few tightly related files. If the
+         ChangeSpec spans many files or unrelated concerns, reject.
+
+      3. Containment — The ChangeSpec states what it does NOT do, and
+         sibling ChangeSpecs cover those excluded parts. An agent seeing
+         only this ChangeSpec understands its scope AND boundaries without
+         reading siblings.
+
+      4. Stability — After this ChangeSpec alone, the tree is production-
+         shaped: build passes, tests pass, lint/format clean, no
+         half-wired features behind feature flags that break callers. No
+         "temporary" states that depend on a later ChangeSpec.
+
+      Additional plan-level checks:
+      - Ordering: each ChangeSpec's preconditions are satisfied by earlier
+        ChangeSpecs or the existing repo state.
+      - Coverage: the sum of ChangeSpecs fully satisfies the problem
+        statement. No silent scope narrowing.
+      - Verification: every ChangeSpec has a concrete verification command
+        you could run yourself.
+
+      Decision:
+      - PDD_APPROVED: every ChangeSpec passes all 4 gates AND the plan-
+        level checks. Before emitting:
+        a. Run `ralph tools task list` to see every open runtime task.
+        b. For each open task, run `ralph tools task close <task-id>`.
+           Re-run and confirm zero open tasks remain. If any task cannot
+           be closed, emit plan.rejected explaining why rather than
+           PDD_APPROVED.
+        c. Write APPROVED.md with the ChangeSpec index and the handoff
+           instruction: "Run ralph with builtin:code-assist against this
+           PDD."
+        d. Call `ralph emit "PDD_APPROVED" "<summary>"`. After that emit,
+           your response MUST end with the literal token `PDD_APPROVED`
+           on its own line as the very last non-empty line — NO prose,
+           comments, or trailing sentences after it. Any trailing text
+           suppresses termination.
+      - plan.rejected: at least one gate or plan-level check fails. Write
+        reviewer-feedback.md naming each failing ChangeSpec, the failed
+        gate, and concrete guidance. Emit plan.rejected.
+
+      Default is plan.rejected. If you did not actively verify every gate
+      for every ChangeSpec, this hat rejects.
+
+      Constraints:
+      - You MUST NOT rewrite ChangeSpecs yourself — give feedback only.
+      - You MUST NOT approve with "minor issues to fix during execution".
+      - You MUST NOT approve a plan where any ChangeSpec leaves the tree
+        broken.
+      - You MUST cite the specific ChangeSpec number and gate for every
+        rejection reason.

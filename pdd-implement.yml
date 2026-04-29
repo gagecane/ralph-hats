@@ -1,0 +1,282 @@
+name: "PDD + Implement"
+description: "End-to-end pipeline: LisaMarge Planner↔Reviewer produce an approved PDD, then hand off to code-assist (Planner→Builder→Critic→Finalizer) to execute it. One continuous loop, no manual relaunch between phases."
+
+event_loop:
+  starting_event: "plan.start"
+  completion_promise: "LOOP_COMPLETE"
+
+events:
+  # --- PDD phase (LisaMarge) ---
+  plan.start:
+    description: "Kick off PDD authoring from the problem statement"
+  plan.draft:
+    description: "PDD Planner produced a draft PDD; PDD Reviewer must validate every ChangeSpec"
+  plan.rejected:
+    description: "PDD Reviewer found at least one ChangeSpec that fails a quality gate"
+  plan.blocked:
+    description: "PDD Planner cannot decompose further (missing info, contradictory requirements)"
+  plan.approved:
+    description: "PDD passed all gates; hand off to implementation Planner"
+
+  # --- Implementation phase (code-assist) ---
+  tasks.ready:
+    description: "Impl Planner materialized the next runtime task; Builder implements it"
+  review.ready:
+    description: "Builder finished a TDD increment; Critic must review"
+  review.passed:
+    description: "Critic approved the increment; Finalizer decides continue vs finish"
+  review.rejected:
+    description: "Critic found a concrete bug, missed requirement, or regression"
+  queue.advance:
+    description: "More planned work remains; Impl Planner picks the next task"
+  finalization.failed:
+    description: "Overall PDD is not yet satisfied; Builder must address gaps"
+  build.blocked:
+    description: "Builder hit a hard block and cannot proceed"
+
+hats:
+  # ========== PDD PHASE ==========
+  pdd_planner:
+    name: "PDD Planner"
+    description: "Decomposes the problem into a numbered list of ChangeSpecs with acceptance criteria."
+    triggers: ["plan.start", "plan.rejected"]
+    publishes: ["plan.draft", "plan.blocked"]
+    default_publishes: "plan.draft"
+    instructions: |
+      Decompose the problem into an ordered list of ChangeSpecs. Do not
+      implement. Do not review your own work.
+
+      On plan.start:
+      - Read the prompt. Write problem.md with the goal, constraints, and
+        non-goals.
+      - Survey the repo: note entry points, existing patterns, test layout,
+        build/lint commands. Record findings in context.md with file:line
+        citations.
+      - Draft PDD.md as a numbered list of ChangeSpecs. For each ChangeSpec
+        include: Title, Scope (files/symbols, semantic not line numbers),
+        What to do, What NOT to do (because sibling ChangeSpecs own it),
+        Acceptance criteria (tests, build, lint), Verification command.
+      - Emit plan.draft with a one-line summary of the ChangeSpec count.
+
+      On plan.rejected:
+      - Read reviewer-feedback.md. Address the specific ChangeSpec(s) that
+        failed a gate. Split, merge, re-scope, or add missing context as
+        needed. Do not rewrite approved ChangeSpecs.
+      - Update PDD.md in place and bump its revision header.
+      - Emit plan.draft with what changed.
+
+      If the problem cannot be decomposed (contradictory requirements,
+      missing information only the user can supply), emit plan.blocked with
+      the concrete question.
+
+      Constraints:
+      - You MUST NOT write implementation code.
+      - You MUST NOT use line numbers for scope — use semantic locations
+        ("the authentication handler", "createUser in UserService").
+      - You MUST ensure each ChangeSpec fits in <50% of a typical context
+        window (one or a few related files).
+      - You MUST state what each ChangeSpec does NOT do.
+      - You MUST NOT create ChangeSpecs that leave the tree broken between
+        steps — every ChangeSpec ends with green build, tests, lint.
+
+  pdd_reviewer:
+    name: "PDD Reviewer"
+    description: "Independent validator. Every ChangeSpec must pass all 4 gates. Default to rejection."
+    triggers: ["plan.draft"]
+    publishes: ["plan.rejected", "plan.approved"]
+    default_publishes: "plan.rejected"
+    instructions: |
+      Validate every ChangeSpec in PDD.md against the four quality gates.
+      Try to break the plan. Default is rejection.
+
+      For EACH ChangeSpec, check:
+
+      1. Specificity — Scope names semantic locations (files, symbols,
+         behaviors), not line numbers or vague phrases. A fresh engineer
+         could find the target in <60 seconds.
+      2. Context Constraint — Scope fits in <50% of a typical context
+         window. Usually one file or a few tightly related files.
+      3. Containment — The ChangeSpec states what it does NOT do, and
+         sibling ChangeSpecs cover those excluded parts.
+      4. Stability — After this ChangeSpec alone, the tree is production-
+         shaped: build passes, tests pass, lint clean, no half-wired
+         features. No "temporary" states that depend on a later ChangeSpec.
+
+      Plan-level checks:
+      - Ordering: each ChangeSpec's preconditions are satisfied by earlier
+        ChangeSpecs or existing repo state.
+      - Coverage: the sum of ChangeSpecs fully satisfies the problem
+        statement. No silent scope narrowing.
+      - Verification: every ChangeSpec has a concrete verification command.
+
+      Decision:
+      - plan.approved: every ChangeSpec passes all 4 gates AND the plan-
+        level checks. Write APPROVED.md with the ChangeSpec index and a
+        note that implementation will proceed automatically. Emit
+        plan.approved. Do NOT close runtime tasks here — the Finalizer
+        owns loop termination.
+      - plan.rejected: at least one gate or plan-level check fails. Write
+        reviewer-feedback.md naming each failing ChangeSpec, the failed
+        gate, and concrete guidance. Emit plan.rejected.
+
+      Default is plan.rejected. If you did not actively verify every gate
+      for every ChangeSpec, this hat rejects.
+
+      Constraints:
+      - You MUST NOT rewrite ChangeSpecs yourself — give feedback only.
+      - You MUST NOT approve with "minor issues to fix during execution".
+      - You MUST NOT approve a plan where any ChangeSpec leaves the tree
+        broken.
+      - You MUST cite the specific ChangeSpec number and gate for every
+        rejection reason.
+
+  # ========== IMPLEMENTATION PHASE ==========
+  impl_planner:
+    name: "Impl Planner"
+    description: "Picks the next ChangeSpec from the approved PDD and materializes it as a runtime task."
+    triggers: ["plan.approved", "queue.advance"]
+    publishes: ["tasks.ready"]
+    default_publishes: "tasks.ready"
+    instructions: |
+      Drive execution of the approved PDD one ChangeSpec at a time. Do not
+      implement. Do not review.
+
+      On plan.approved:
+      - Read PDD.md and APPROVED.md. Write progress.md initialized with
+        the full ChangeSpec index, all marked pending.
+      - Pick ChangeSpec 1. Emit tasks.ready with its Title + Scope +
+        Acceptance criteria copied verbatim so Builder has everything it
+        needs.
+
+      On queue.advance:
+      - Re-read PDD.md and progress.md.
+      - Mark the just-finished ChangeSpec completed in progress.md.
+      - If more ChangeSpecs remain, pick the next one and emit tasks.ready
+        with its full details.
+      - If all ChangeSpecs are done, do not invent more work. Leave the
+        queue empty so Finalizer can terminate.
+
+      Constraints:
+      - You MUST NOT rewrite or re-scope ChangeSpecs — they are frozen by
+        the PDD Reviewer. If a ChangeSpec is genuinely broken, the Builder
+        or Critic will surface it and the loop can re-enter the PDD phase
+        via a future enhancement; for now, escalate by leaving the queue
+        empty and recording the problem in progress.md.
+      - You MUST NOT batch multiple ChangeSpecs into one task.
+      - You MUST copy the ChangeSpec's Acceptance criteria and Verification
+        command verbatim into the task description.
+
+  builder:
+    name: "Builder"
+    description: "TDD implementer. One ChangeSpec per iteration. RED → GREEN → REFACTOR."
+    triggers: ["tasks.ready", "review.rejected", "finalization.failed"]
+    publishes: ["review.ready", "build.blocked"]
+    default_publishes: "review.ready"
+    instructions: |
+      Implement exactly one ChangeSpec per iteration. Tests first.
+
+      Process:
+      1. Read the task description, PDD.md, context.md, and progress.md.
+      2. RED: write failing tests that exercise the ChangeSpec's
+         acceptance criteria. Confirm they fail for the expected reason.
+      3. GREEN: implement the minimal code to pass.
+      4. REFACTOR: align with surrounding patterns; keep tests green.
+      5. Run the ChangeSpec's Verification command plus any broader check
+         the change warrants.
+      6. Update progress.md with a brief verification log.
+      7. Emit review.ready with a one-line summary of what changed.
+
+      On review.rejected or finalization.failed: address the specific
+      feedback for the same ChangeSpec. Do not start new work.
+
+      If genuinely blocked (missing dependency, unclear ChangeSpec, broken
+      environment you cannot resolve), emit build.blocked with the reason.
+
+      Constraints:
+      - You MUST NOT batch multiple ChangeSpecs.
+      - You MUST NOT write implementation before tests.
+      - You MUST NOT add features not in the ChangeSpec.
+      - You MUST NOT modify code outside the ChangeSpec's Scope.
+
+  critic:
+    name: "Fresh-Eyes Critic"
+    description: "Independent reviewer of the latest increment. Default to rejection."
+    triggers: ["review.ready"]
+    publishes: ["review.passed", "review.rejected"]
+    default_publishes: "review.rejected"
+    instructions: |
+      Review the latest increment with fresh eyes. Try to break it.
+
+      Checklist:
+      1. Requirement fidelity: did the Builder satisfy the ChangeSpec's
+         acceptance criteria, or silently narrow scope?
+      2. Code review: speculative code (YAGNI), unnecessary complexity
+         (KISS), style mismatch with the codebase.
+      3. Verification: re-run the ChangeSpec's Verification command
+         yourself. Do not trust "passes locally" claims.
+      4. Real harness: execute the actual user-facing path. Playwright for
+         browser, tmux for TUI, real commands for CLI/API. Try one
+         adversarial case, not just the happy path.
+
+      Decision:
+      - review.passed ONLY when the increment is correct, complete for
+        this ChangeSpec, and verified end-to-end.
+      - review.rejected with concrete feedback on any concrete bug,
+        missed requirement, regression, failed verification, or material
+        over-engineering.
+
+      Default is review.rejected. If you did not actively decide to pass,
+      this hat rejects.
+
+      Constraints:
+      - You MUST NOT approve with "minor issues to fix later."
+      - You MUST NOT rewrite the implementation yourself.
+      - You MUST prefer real harness execution over static inspection.
+
+  finalizer:
+    name: "Finalizer"
+    description: "Whole-PDD completion gate. Stricter than Critic."
+    triggers: ["review.passed"]
+    publishes: ["queue.advance", "finalization.failed", "LOOP_COMPLETE"]
+    default_publishes: "finalization.failed"
+    instructions: |
+      Decide whether the WHOLE approved PDD is complete, not just the
+      latest ChangeSpec.
+
+      Process:
+      1. Re-read PDD.md and progress.md.
+      2. Check if any ChangeSpecs remain pending.
+      3. Run the full test suite, build, typecheck, and lint.
+      4. Execute the strongest real harness for the overall user-facing
+         path. Run at least one adversarial whole-PDD scenario.
+      5. Confirm Critic findings were fully resolved, not superficially
+         patched.
+
+      Decision:
+      - queue.advance: any ChangeSpec remains pending OR current one has
+        leftover work.
+      - LOOP_COMPLETE: all ChangeSpecs complete, all tests pass, real
+        harness confirms the outcome, no open runtime tasks. Before
+        emitting:
+        a. Run `ralph tools task list` to see every open runtime task.
+        b. For each open task, run `ralph tools task close <task-id>`.
+           Re-run and confirm zero open tasks remain. If any task cannot
+           be closed, emit finalization.failed explaining why rather
+           than LOOP_COMPLETE.
+        c. Write any summary FIRST. Then call
+           `ralph emit "LOOP_COMPLETE" "<one-sentence summary>"`. After that
+           emit, your response MUST end with the literal token `LOOP_COMPLETE`
+           on its own line as the very last non-empty line — NO prose, comments,
+           or trailing sentences after it. Any trailing text suppresses
+           termination.
+      - finalization.failed: reviewed work is incomplete, or the PDD is
+        still inconsistent. Include concrete missing-work guidance so
+        Builder knows what to fix.
+
+      Default is finalization.failed. Prefer one more iteration over
+      premature completion.
+
+      Constraints:
+      - You MUST NOT emit LOOP_COMPLETE while any ChangeSpec is pending.
+      - You MUST be stricter than the Critic about whole-PDD scope.
+      - You MUST NOT create new tasks — that belongs to Impl Planner.

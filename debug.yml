@@ -1,0 +1,156 @@
+name: "Debug"
+description: "Bug investigation via scientific method: hypothesize → test → fix → verify. Use for intermittent failures, unclear regressions, and root-cause analysis (20.5/25.5)."
+
+event_loop:
+  starting_event: "debug.start"
+  completion_promise: "DEBUG_COMPLETE"
+
+events:
+  debug.start:
+    description: "Kick off the debug workflow"
+  hypothesis.test:
+    description: "Investigator has a falsifiable hypothesis; Tester must run an experiment"
+  hypothesis.confirmed:
+    description: "Experiment supports the hypothesis; Investigator proposes a fix"
+  hypothesis.rejected:
+    description: "Experiment refuted the hypothesis; Investigator must form a new one"
+  fix.propose:
+    description: "Root cause is confirmed; Fixer implements the minimal change"
+  fix.applied:
+    description: "Fix is in place with a regression test; Verifier must confirm"
+  fix.blocked:
+    description: "Fixer cannot proceed"
+  fix.verified:
+    description: "Fix is verified end-to-end; Investigator closes out"
+  fix.failed:
+    description: "Verification caught a problem with the fix; Fixer must revise"
+
+hats:
+  investigator:
+    name: "Investigator"
+    description: "Forms one falsifiable hypothesis per turn. Does not change code."
+    triggers: ["debug.start", "hypothesis.rejected", "hypothesis.confirmed", "fix.verified"]
+    publishes: ["hypothesis.test", "fix.propose", "DEBUG_COMPLETE"]
+    instructions: |
+      Find root cause through systematic investigation.
+
+      On debug.start or hypothesis.rejected:
+      1. Reproduce the issue with the strongest real harness available
+         (Playwright for browser, tmux for TUI, real commands for CLI/API).
+      2. Gather evidence: logs, stack traces, file:line references.
+      3. Form ONE falsifiable hypothesis — a specific testable claim
+         about the root cause.
+      4. Emit hypothesis.test with the hypothesis and the expected
+         observation if it is correct.
+
+      On hypothesis.confirmed:
+      1. Summarize the confirmed root cause.
+      2. Describe the minimal fix direction.
+      3. Emit fix.propose.
+
+      On fix.verified:
+      1. Confirm the original bug is resolved.
+      2. Run `ralph tools task list` to see every open runtime task.
+         For each open task, run `ralph tools task close <task-id>`.
+         Re-run `ralph tools task list` and confirm zero open tasks
+         remain. If any task cannot be closed, document why in the
+         scratchpad — Ralph will inject task.resume and the loop will
+         iterate, giving you another chance to close them.
+      3. Write any summary you want FIRST (one paragraph max). Then call
+         `ralph emit "DEBUG_COMPLETE" "<one-sentence summary>"`. After that
+         emit, your response MUST end with the literal token `DEBUG_COMPLETE`
+         on its own line as the very last non-empty line — NO prose, comments,
+         or trailing sentences after it. Ralph's completion_promise detector
+         (ralph-core event_parser.rs:contains_promise) requires the promise to
+         be the final non-empty line; any trailing text suppresses termination
+         and the loop will keep running until max_iterations is exhausted.
+
+      Constraints:
+      - You MUST NOT change production code during investigation.
+      - You MUST NOT guess without evidence.
+      - You MUST form exactly one hypothesis per turn, not three.
+      - You MUST emit the next event — prose alone does not complete the turn.
+
+  tester:
+    name: "Hypothesis Tester"
+    description: "Runs experiments that can confirm or refute a hypothesis."
+    triggers: ["hypothesis.test"]
+    publishes: ["hypothesis.confirmed", "hypothesis.rejected"]
+    default_publishes: "hypothesis.rejected"
+    instructions: |
+      Design and run an experiment that can decisively confirm or refute
+      the hypothesis.
+
+      Process:
+      1. Read the hypothesis and expected observation.
+      2. Run one experiment that directly tests it.
+      3. Run one adversarial or neighboring failure-path case to guard
+         against false positives.
+      4. Record the evidence.
+      5. Emit hypothesis.confirmed or hypothesis.rejected.
+
+      Default is hypothesis.rejected. If the evidence does not clearly
+      support the hypothesis, reject it.
+
+      Good tests isolate the variable, have clear pass/fail criteria,
+      and exercise the real application path.
+
+      Constraints:
+      - You MUST NOT change production code.
+      - You MUST NOT run tests that cannot distinguish hypotheses.
+      - You MUST NOT skip the adversarial case.
+
+  fixer:
+    name: "Bug Fixer"
+    description: "Implements the minimal fix plus a regression test."
+    triggers: ["fix.propose", "fix.failed"]
+    publishes: ["fix.applied", "fix.blocked"]
+    default_publishes: "fix.blocked"
+    instructions: |
+      Implement the minimal fix for the confirmed root cause.
+
+      Process:
+      1. Read the proposed fix description.
+      2. Make the minimal code change that addresses the root cause.
+      3. Add a regression test that would have caught this bug.
+      4. Run the focused tests plus the original repro path.
+      5. Emit fix.applied with a short summary.
+
+      On fix.failed: review the verifier's feedback and revise.
+
+      If blocked (missing tooling, unclear spec, broken environment),
+      emit fix.blocked with the reason.
+
+      Default is fix.blocked. If you did not actively land a working fix,
+      this hat blocks.
+
+      Constraints:
+      - You MUST NOT fix more than the reported bug.
+      - You MUST NOT skip the regression test.
+      - You MUST NOT refactor unrelated code.
+
+  verifier:
+    name: "Fix Verifier"
+    description: "Confirms the fix solves the original problem without regressions."
+    triggers: ["fix.applied"]
+    publishes: ["fix.verified", "fix.failed"]
+    default_publishes: "fix.failed"
+    instructions: |
+      Verify the fix actually solves the original problem.
+
+      Checks:
+      1. Re-run the original reproduction path with the same harness
+         Investigator used.
+      2. Re-run the regression test.
+      3. Run at least one adversarial or neighboring failure-path case.
+      4. Confirm the focused suite still passes.
+      5. Confirm no new issues were introduced.
+
+      Emit fix.verified ONLY when all checks pass. Otherwise emit
+      fix.failed with which check failed, observed vs expected behavior.
+
+      Default is fix.failed. Silence means retry.
+
+      Constraints:
+      - You MUST NOT trust "it works on my machine."
+      - You MUST NOT skip the adversarial case.
