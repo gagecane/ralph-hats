@@ -1,159 +1,249 @@
-# Research Preset
-#
-# For deep exploration tasks: codebase analysis, architecture review,
-# technology evaluation, competitive analysis.
-#
-# Key behavior: NO code changes, NO commits. Pure information gathering.
-#
-# Usage:
-#   ralph run --config presets/research.yml --prompt "Analyze the authentication flow"
+name: "Research"
+description: "Multi-wave research with planning, writing, editing, and review. 6 hats: Planner decomposes the question into focused sub-questions, Researcher gathers evidence (min 2, max 5 waves), Synthesizer gates quality, Writer produces the deliverable, Editor polishes, Reviewer approves or sends back (max 2 revisions). Reviewer can also reopen research if evidence is insufficient."
 
 event_loop:
   starting_event: "research.start"
-  completion_promise: "LOOP_COMPLETE"
+  completion_promise: "RESEARCH_COMPLETE"
+
+events:
+  research.start:
+    description: "Kick off the research question"
+  research.planned:
+    description: "Planner has decomposed the question into focused sub-questions"
+  research.finding:
+    description: "Researcher has gathered evidence for the current wave"
+  research.followup:
+    description: "A gap was identified — Researcher runs the next wave"
+  research.ready:
+    description: "Evidence is sufficient — hand off to Writer"
+  draft.complete:
+    description: "Writer has produced a draft deliverable"
+  edit.complete:
+    description: "Editor has polished the draft"
+  draft.revision:
+    description: "Reviewer found issues — Writer revises"
 
 hats:
+  planner:
+    name: "Planner"
+    description: "Decomposes the research question into 2-4 focused sub-questions. Runs once."
+    triggers: ["research.start"]
+    publishes: ["research.planned"]
+    default_publishes: "research.planned"
+    max_activations: 1
+    instructions: |
+      Decompose the research question into focused, independent sub-questions.
+
+      Process:
+      1. Read the research question from the event payload or PRD.
+      2. Identify 2-4 independent angles that together would answer the
+         question comprehensively. Each sub-question should be:
+         - Answerable through code search, doc reading, or runtime observation
+         - Scoped tightly enough for a single research wave
+         - Non-overlapping with other sub-questions
+      3. Write the plan to the scratchpad:
+           ## Research Plan
+           Original question: <the full question>
+           Sub-questions:
+           1. <focused sub-question>
+           2. <focused sub-question>
+           ...
+      4. Emit research.planned with the sub-question list.
+
+      Constraints:
+      - You MUST NOT do research yourself — only decompose.
+      - You MUST NOT write or modify code.
+      - You MUST produce 2-4 sub-questions, not more.
+      - Each sub-question must be independently investigable.
+
   researcher:
     name: "Researcher"
-    description: "Gathers information and analyzes patterns. No code changes."
-    triggers: ["research.start", "research.followup"]
+    description: "Gathers evidence for one numbered wave. No code changes. Max 5 waves."
+    triggers: ["research.planned", "research.followup"]
     publishes: ["research.finding"]
     default_publishes: "research.finding"
+    max_activations: 5
     instructions: |
-      ## RESEARCHER MODE
+      Gather evidence for the current research wave. Do not implement.
+      Do not speculate — cite file:line or observed output.
 
-      Start from the auto-injected objective and current event context.
-      You are running inside Ralph. `ralph emit`, `ralph tools task`, and `ralph tools memory` are available in this turn.
-      Do not spawn subagents for this preset. Gather the evidence directly so you can emit the next event yourself.
-      You MUST NOT invoke `[Tool] Agent` or any parallel subagent tool in this preset.
+      Scratchpad format — use this exact structure:
+        ## Wave 1
+        Question: <the research question or followup gap>
+        Findings:
+        - <evidence point> (file:line or command output)
+        ...
+        Gap: <unresolved question, or "none">
 
-      You're researching, not implementing. Gather information, analyze patterns, synthesize insights.
+      Process:
+      1. Read the scratchpad. Count existing `## Wave N` headers to
+         determine the current wave number (default: 1).
+         If wave 5 already exists, STOP and emit research.finding
+         with a note that the 5-wave cap has been reached.
+      2. Read the Research Plan from the scratchpad. For wave 1, pick
+         the first sub-question. For followup waves, read the gap from
+         the Synthesizer's feedback or the next unaddressed sub-question.
+      3. Search the codebase, docs, and runtime behavior directly.
+      4. For runnable behavior, observe with the real harness (Playwright,
+         tmux, curl) rather than reasoning from code alone.
+      5. Challenge your own theory: look for contradictory evidence.
+      6. Once you have 3–6 concrete evidence points with citations and
+         identified at most one highest-value unresolved gap, stop.
+      7. Append findings to the scratchpad using the format above
+         (## Wave N, Question, Findings with citations, Gap).
+      8. Emit research.finding with the wave number, a concise evidence
+         summary, and any unresolved gap.
 
-      Runtime tasks are the canonical queue. Findings markdown is evidence, not scheduler state.
-      Do not spend turns on environment or tool-availability diagnosis. Use the workflow commands directly and verify queue or artifact state only when you need to confirm a terse result.
-
-      ### Step-Wave Research Plan
-      Create `.ralph/agent/research/plan.md` as a numbered wave plan.
-      The plan should capture:
-      - Step 1: initial question group
-      - Step 2+: follow-up question groups only if the previous wave exposes a real gap
-
-      Runtime tasks are the live scheduler, but only the CURRENT research wave may exist as open work.
-
-      ### Runtime Task Discipline
-      - On `research.start`, ensure only the first research-wave task(s) with stable keys like `research:step-01:primary`
-      - On `research.followup`, ensure only the next research-wave task(s) with stable keys like `research:step-02:{slug}`
-      - Start the active task with `ralph tools task start <task_id>`
-      - Keep the active `task_id` and `task_key` in every `research.finding` payload
-      - Search memories before acting in unfamiliar areas
-      - Save durable reusable learnings with `ralph tools memory add` when they would help future runs
-
-      ### Trigger Handling
-      On `research.start` or `research.followup`:
-      1. Re-read `.ralph/agent/research/plan.md` and identify the current numbered wave.
-      2. Scope the current wave's question precisely.
-      3. Search broadly enough to answer the asked question, but stay bounded to directly relevant code, config, tests, and harness definitions.
-      4. Challenge your own theory. Look for contradictory evidence and failure cases, not just supporting evidence.
-      5. As soon as you have 3-6 concrete evidence points with file:line support and one clear highest-value unresolved gap or "no gap", stop gathering and move to synthesis.
-      6. If `.ralph/agent/research/summary.md` already contains the current wave's answer and open question from a prior attempt, do a quick sanity check, refresh the wording if needed, and emit. Do NOT restart broad discovery.
-      7. Update `.ralph/agent/research/summary.md` with the current findings and any open questions.
-      8. If this wave reveals a highest-value unresolved gap or follow-up question, record it explicitly as unresolved. Do NOT investigate that next wave inline in the same turn.
-      9. Close the current runtime task only if the current wave's question is answered well enough for synthesis.
-      10. Send a progress update before emitting:
-          ```
-          "$RALPH_BIN" tools interact progress "🔍 Research wave {step} complete: {one_line_summary}"
-          ```
-      11. Emit exactly one `research.finding` event with `task_id`, `task_key`, the current step number, a concise evidence summary, and any unresolved questions.
-      12. Stop immediately after emitting.
-      13. Once the summary answers the current question well enough for synthesis, emit immediately. Do not keep browsing adjacent docs, skills, or side topics in the same turn.
-
-      The turn is incomplete until a real `ralph emit "research.finding" ...` command succeeds.
-
-      ### High-Fidelity Evidence
-      If the question involves runnable behavior, prefer direct observation:
-      - Use Playwright or equivalent for browser flows
-      - Use tmux or equivalent for terminal/TUI flows
-      - Use real commands or requests for API/CLI flows
-
-      Do not infer behavior from code alone when you can exercise it.
-
-      ### Scratchpad
-      Write working notes to `.ralph/agent/scratchpad/scratchpad.md` (not `.ralph/agent/scratchpad.md`).
-
-      Format:
-      ```markdown
-      # Research: [Topic]
-
-      ## Questions
-      - [ ] Primary question
-      - [ ] Secondary questions discovered
-
-      ## Findings
-      ### [Area 1]
-      - Finding with file:line references
-
-      ## Open Questions
-      - Things that need more investigation
-
-      ## Summary
-      [Synthesized answer to the original question]
-      ```
-
-      ### DON'T
-      - ❌ Write or modify code
-      - ❌ Make commits
-      - ❌ Suggest implementations (unless asked)
-      - ❌ Make assumptions—verify with code search
-      - ❌ Keep browsing once you already have enough evidence for this wave
-      - ❌ Emit `research.finding` without `task_id` and `task_key`
-      - ❌ End the turn after writing `summary.md` without emitting `research.finding`
+      Constraints:
+      - You MUST NOT write or modify code.
+      - You MUST NOT make commits.
+      - You MUST NOT suggest implementations unless explicitly asked.
+      - You MUST NOT make assumptions — verify with search or execution.
+      - You MUST NOT keep browsing once you have enough evidence for this wave.
+      - You MUST cite file:line or command output for every claim.
+      - You MUST track the wave number in the scratchpad. Max 5 waves.
 
   synthesizer:
     name: "Synthesizer"
-    description: "Reviews findings and creates coherent summary."
+    description: "Evaluates evidence depth. Pushes back aggressively. Min 2 waves before ready."
     triggers: ["research.finding"]
-    publishes: ["research.followup", "LOOP_COMPLETE"]
+    publishes: ["research.followup", "research.ready"]
+    default_publishes: "research.followup"
+    max_activations: 5
     instructions: |
-      ## SYNTHESIZER MODE
+      Review the findings and decide: more research or ready to write.
 
-      Start from the auto-injected objective and current event context.
-      You are running inside Ralph. `ralph emit` and `ralph tools task` are available.
-      Do not spawn subagents for this preset.
+      Process:
+      1. Read the current wave's findings and all prior waves from the scratchpad.
+      2. Read the Research Plan (## Research Plan section) and note which
+         sub-questions have been addressed by at least one wave's findings.
+      3. Count `## Wave N` headers in the scratchpad to determine the current
+         wave number. If wave < 2, you MUST emit research.followup
+         regardless of evidence quality — minimum 2 waves is mandatory.
+      4. If wave >= 2, evaluate critically:
+         - Are ALL sub-questions from the Research Plan covered by evidence?
+           If any sub-question has zero evidence, emit research.followup
+           targeting that sub-question specifically.
+         - What would disprove the current conclusions?
+         - What adjacent systems or docs were NOT checked?
+         - Is there runtime evidence, or only static code reading?
+         - Are there contradictions between waves?
+      5. If a meaningful gap remains and wave < 5, emit research.followup
+         with the exact unresolved question (preferring uncovered sub-questions).
+      6. If wave = 5 (cap reached) OR all sub-questions have evidence AND
+         evidence is genuinely comprehensive, emit research.ready with a
+         summary of what the Writer should produce.
 
-      Review findings and create coherent summary.
-      Do not spend turns on environment or tool-availability diagnosis. Use the workflow commands directly and verify queue or artifact state only when you need to confirm a terse result.
+      Default is research.followup. Err toward one more wave over premature
+      handoff to writing.
 
-      Runtime tasks are the completion gate. You may only emit `LOOP_COMPLETE`
-      when the active research task is closed, all planned research waves are complete, and no research follow-up tasks remain open.
+      Constraints:
+      - You MUST NOT do new research yourself.
+      - You MUST NOT make code changes.
+      - You MUST NOT emit research.ready before wave 2.
+      - You MUST end with exactly one emit.
 
-      1. Read the `research.finding` payload and the corresponding runtime task via `ralph tools task show <task_id> --format json`
-         - If the payload omitted `task_id`, resolve the active task from open tasks with keys like `research:step-01:primary` or `research:step-02:{slug}`
-      2. Review all findings from research
-      3. Identify patterns, contradictions, and remaining gaps
-      4. Reject shallow conclusions that are not backed by evidence
-      5. If the current question is answered, close the completed runtime task with `ralph tools task close <task_id>`
-      6. If meaningful gaps remain:
-         - append the next numbered wave to `.ralph/agent/research/plan.md`
-         - ensure ONLY the next follow-up runtime task(s) with a stable key like `research:step-02:{slug}`
-         - publish `research.followup` with the follow-up `task_id`, `task_key`, step number, and the exact unresolved question
-      7. A gap merely mentioned in the summary does NOT satisfy the follow-up requirement. If you identified a highest-value unresolved question, you MUST emit `research.followup` rather than `LOOP_COMPLETE`.
-      8. If the original question is fully answered and no research tasks remain open, audit open tasks, send a progress update, then emit `LOOP_COMPLETE`:
-         ```bash
-         open_tasks=$("$RALPH_BIN" tools task list --format json 2>/dev/null | python3 -c "import json,sys; t=json.load(sys.stdin); print(len([x for x in t if x.get('status') not in ('closed','completed','cancelled')]))" 2>/dev/null || echo "?")
-         "$RALPH_BIN" tools interact progress "✅ Research complete: {one_line_conclusion} | ${open_tasks} tasks remaining"
-         ```
-      9. If emitting `research.followup`, send a progress update first:
-         ```
-         "$RALPH_BIN" tools interact progress "🔍 Research follow-up needed: {unresolved_question}"
-         ```
-      10. Every synthesizer turn MUST finish with exactly one `ralph emit` command for either `research.followup` or `LOOP_COMPLETE`
-      11. Once you can choose follow-up vs completion, emit immediately. Do not keep polishing the prose in the same turn.
+  writer:
+    name: "Writer"
+    description: "Produces the deliverable document from scratchpad evidence. Flexible format based on the task."
+    triggers: ["research.ready", "draft.revision"]
+    publishes: ["draft.complete"]
+    default_publishes: "draft.complete"
+    max_activations: 3
+    instructions: |
+      Produce the deliverable document from the research evidence.
 
-      ### DON'T
-      - ❌ Do new research (that's researcher's job)
-      - ❌ Make code changes
-      - ❌ End the turn with only prose or an updated summary file
+      Process:
+      1. Read the full scratchpad with all wave findings.
+      2. Read the original research question / PRD to understand the
+         expected deliverable format and location.
+      3. If triggered by draft.revision, read the Reviewer's feedback
+         and the current draft to understand what needs fixing.
+      4. Write the deliverable:
+         - Structure it with clear sections and headings.
+         - Every factual claim must trace back to a scratchpad citation.
+         - Include a sources/references section.
+         - Draw conclusions and highlight open questions honestly.
+      5. Write the deliverable to the path specified in the PRD,
+         or to docs/ if no path is specified.
+      6. Emit draft.complete with the file path and a brief summary.
 
-      ### DONE
-      When the original question has been answered with evidence and no follow-up is needed,
-      emit `LOOP_COMPLETE` via `ralph emit`, then stop.
+      Constraints:
+      - You MUST NOT do new research — only use existing scratchpad evidence.
+      - You MUST NOT make code changes beyond writing the deliverable document.
+      - You MUST NOT fabricate citations or evidence not in the scratchpad.
+      - You MUST write the actual file, not just describe what it would contain.
+
+  editor:
+    name: "Editor"
+    description: "Polishes the draft for clarity, structure, and readability. One pass."
+    triggers: ["draft.complete"]
+    publishes: ["edit.complete"]
+    default_publishes: "edit.complete"
+    max_activations: 3
+    instructions: |
+      Polish the draft deliverable for publication quality.
+
+      Process:
+      1. Read the draft document produced by the Writer.
+      2. Improve without changing substance:
+         - Fix grammar, spelling, and punctuation.
+         - Improve sentence clarity and flow.
+         - Ensure consistent formatting and heading hierarchy.
+         - Tighten verbose passages.
+         - Verify all citations are properly formatted.
+         - Ensure the document reads well as a standalone artifact.
+      3. Edit the file in place.
+      4. Emit edit.complete with a brief summary of changes made.
+
+      Constraints:
+      - You MUST NOT add new content, claims, or evidence.
+      - You MUST NOT remove substantive content or conclusions.
+      - You MUST NOT do new research.
+      - You MUST NOT make code changes beyond editing the deliverable.
+      - This is a single polish pass — do not over-edit.
+
+  reviewer:
+    name: "Reviewer"
+    description: "Reviews the polished draft. Can approve, send back to Writer (max 2 rounds), or reopen research."
+    triggers: ["edit.complete"]
+    publishes: ["draft.revision", "research.followup", "RESEARCH_COMPLETE"]
+    default_publishes: "draft.revision"
+    max_activations: 4
+    instructions: |
+      Review the polished draft against the scratchpad evidence and original question.
+
+      Process:
+      1. Read the edited deliverable, the scratchpad, and the original question.
+      2. Check the revision count: count `## Revision N` headers in the
+         scratchpad (default: 0 if none exist).
+      3. Evaluate:
+         - Does every claim have a supporting citation from the scratchpad?
+         - Are conclusions logically sound given the evidence?
+         - Does the document answer the original research question?
+         - Are there structural or clarity issues the Editor missed?
+         - Is there an evidence gap that writing exposed?
+      4. Decision:
+         a. If an EVIDENCE gap is found (not a writing issue) and research
+            waves < 5: emit research.followup with the specific gap.
+            Increment the wave counter note in the scratchpad.
+         b. If writing issues found and revision count < 2: emit
+            draft.revision with specific, actionable feedback.
+            Append `## Revision N` with your feedback to the scratchpad.
+         c. If revision count = 2 (cap reached): approve as-is with a
+            note about remaining imperfections.
+         d. If the draft is good:
+            - Run `ralph tools task list` and close all open tasks.
+            - Confirm zero open tasks remain.
+            - Write a one-line approval note to the scratchpad.
+            - Call `ralph emit "RESEARCH_COMPLETE" "<one-sentence summary>"`.
+            - End your response with the literal token RESEARCH_COMPLETE
+              on its own line as the very last non-empty line.
+
+      Constraints:
+      - You MUST NOT do new research yourself.
+      - You MUST NOT edit the deliverable directly — send back to Writer.
+      - You MUST NOT approve after revision 2 if there are evidence gaps —
+        emit research.followup instead.
+      - You MUST track revision count via `## Revision N` headers in the scratchpad.
+      - You MUST end with exactly one emit.

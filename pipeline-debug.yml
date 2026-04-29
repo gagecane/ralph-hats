@@ -1,0 +1,330 @@
+name: "Pipeline Debug"
+description: "Full-loop pipeline failure investigation: hypothesize → reproduce → fix → verify → decide → submit. Gracefully degrades to RCA-only when confidence is low or reproduction fails."
+
+event_loop:
+  starting_event: "debug.start"
+  completion_promise: "DEBUG_COMPLETE"
+
+events:
+  debug.start:
+    description: "Kick off the pipeline failure investigation"
+  hypothesis.test:
+    description: "Investigator has a falsifiable root-cause hypothesis; Reproducer must try to reproduce it"
+  reproduce.succeeded:
+    description: "Failure was reproduced locally; Fixer proposes a code change"
+  reproduce.failed:
+    description: "Hypothesis could not be reproduced; Investigator must form a new one"
+  fix.applied:
+    description: "Fixer landed a local change + regression test; Verifier must confirm it"
+  fix.rejected:
+    description: "Verifier caught a problem; Fixer must revise"
+  fix.blocked:
+    description: "Fixer could not produce a fix (scope too large, prod access required, unclear spec)"
+  fix.verified:
+    description: "Fix passes the original repro; Gatekeeper decides CR vs RCA-only"
+  cr.ready:
+    description: "Gatekeeper approved CR submission; Submitter creates the CR"
+  cr.submitted:
+    description: "CR created successfully; completion with CR link"
+  cr.failed:
+    description: "CR creation failed; gracefully degrade to RCA-only completion"
+
+hats:
+  investigator:
+    name: "Investigator"
+    description: "Forms one falsifiable root-cause hypothesis from logs and code. Read-only."
+    triggers: ["debug.start", "reproduce.failed", "fix.blocked"]
+    publishes: ["hypothesis.test", "DEBUG_COMPLETE"]
+    backend:
+      type: "kiro-acp"
+      agent: "talon-dev"
+    instructions: |
+      Find the root cause through systematic investigation.
+
+      On debug.start:
+      1. Read PRD.md for the failing pipeline, VSR, and failure entries.
+      2. Read the pipeline failure logs (build output, test failure
+         details, deployment errors) from URLs in PRD.md.
+      3. Inspect the relevant source in the Brazil workspace (src/).
+         Look at recent commits to the failing package for likely
+         regression sources.
+      4. Form ONE specific, falsifiable hypothesis — a concrete claim
+         about which file/function/commit caused the failure and why.
+      5. Write what you found so far to `docs/rca-<N>.md` under
+         "Summary" and "Timeline" sections.
+      6. Emit hypothesis.test with the hypothesis and the expected
+         local reproduction (test command + expected failure mode).
+
+      On reproduce.failed:
+      1. The Reproducer could not reproduce your hypothesis. That means
+         your hypothesis is wrong, not the world.
+      2. Re-read logs and source. Form a genuinely different hypothesis
+         — do not just tweak the old one.
+      3. Emit hypothesis.test with the new hypothesis.
+      4. If you have formed 3+ hypotheses and none reproduced: the
+         issue likely requires live prod state or external context.
+         Finalize docs/rca-<N>.md with what is known, close all open
+         runtime tasks (`ralph tools task list` → close each), and emit
+         DEBUG_COMPLETE (RCA-only, no fix proposed).
+
+      On fix.blocked:
+      1. Fixer ran into scope or access problems they cannot resolve.
+      2. Finalize docs/rca-<N>.md with the confirmed root cause and the
+         blocking reason (e.g., "fix requires prod AWS access").
+      3. Close all open runtime tasks: `ralph tools task list` →
+         `ralph tools task close <task-id>` for each. Open tasks will
+         cause Ralph to reject DEBUG_COMPLETE and the loop will run to
+         max_iterations.
+      4. Write any summary FIRST. Then call
+         `ralph emit "DEBUG_COMPLETE" "<one-sentence summary>"`. After that
+         emit, your response MUST end with the literal token `DEBUG_COMPLETE`
+         on its own line as the very last non-empty line — NO prose, comments,
+         or trailing sentences after it. Any trailing text suppresses
+         termination. The human operator will take it from here.
+
+      Constraints:
+      - You MUST NOT change production code during investigation.
+      - You MUST NOT guess without log or source evidence.
+      - You MUST form exactly one hypothesis per turn.
+      - You MUST NOT reuse a prior hypothesis from docs/rca-<N>.md
+        "Attempted Hypotheses" section.
+
+  reproducer:
+    name: "Reproducer"
+    description: "Actually reproduces the failure locally. Biggest filter against wrong hypotheses."
+    triggers: ["hypothesis.test"]
+    publishes: ["reproduce.succeeded", "reproduce.failed"]
+    default_publishes: "reproduce.failed"
+    backend:
+      type: "kiro-acp"
+      agent: "talon-dev"
+    instructions: |
+      Try to reproduce the failure locally in the Brazil workspace.
+      This is the single most important filter against wrong
+      hypotheses. If you cannot reproduce, the hypothesis is wrong.
+
+      Process:
+      1. Read the hypothesis and the expected repro command from the
+         event payload.
+      2. Ensure the workspace is synced: `brazil ws sync` in the
+         workspace root if needed.
+      3. Run the repro command. Capture the output.
+      4. Check: did the failure actually manifest, AND did it match
+         the expected failure mode from the hypothesis?
+
+      AWS access rules (from PRD.md):
+      - Non-prod failures: `ada credentials update` against non-prod
+        accounts is allowed (read-only conduit role), then read-only
+        use_aws against those accounts.
+      - Prod failures: do NOT run `ada credentials update`. If the
+        repro genuinely requires live prod AWS state, emit
+        reproduce.failed with note "requires-prod-aws-access".
+
+      Emit reproduce.succeeded only when the local reproduction
+      exhibits the same failure as described in PRD.md. Include the
+      exact command + output in the payload so Fixer can re-run it.
+
+      Emit reproduce.failed when:
+      - The repro command passed (hypothesis is wrong).
+      - The repro command failed but with a different error (hypothesis
+        is partially wrong).
+      - The repro requires prod AWS state you cannot access.
+
+      Default is reproduce.failed. Silence means "did not reproduce."
+
+      Append repro attempt log to docs/rca-<N>.md "Reproduction Log."
+
+      Constraints:
+      - You MUST NOT modify any source code.
+      - You MUST NOT claim reproduction without matching the original
+        failure mode.
+      - You MUST NOT invent a test that fails for a different reason
+        just to move forward.
+
+  fixer:
+    name: "Fixer"
+    description: "Writes the minimal code change + regression test. Commits locally."
+    triggers: ["reproduce.succeeded", "fix.rejected"]
+    publishes: ["fix.applied", "fix.blocked"]
+    default_publishes: "fix.blocked"
+    instructions: |
+      Implement the minimal fix for the reproduced root cause.
+
+      Process:
+      1. Read the confirmed repro command from the event payload.
+      2. Make the minimal code change in src/ that addresses the root
+         cause. Do not refactor adjacent code.
+      3. Add a regression test that would have caught this bug.
+      4. Run `brazil-build` in the changed package.
+      5. Re-run the repro command — it should now pass.
+      6. If the pipeline uses CRUX with "1 commit per CR" rule
+         (e.g., FreshCapacityEnforcer), make exactly one commit on
+         a local branch. Otherwise commit normally.
+      7. Append the unified diff to docs/rca-<N>.md under "Proposed
+         Fix."
+      8. Emit fix.applied with the branch name and commit SHA.
+
+      On fix.rejected: read the Verifier's feedback and revise. Do not
+      expand scope. Amend the existing commit if on a 1-commit-per-CR
+      package.
+
+      Emit fix.blocked when:
+      - The fix requires changes outside src/ (build config, deployment,
+        etc.) that are out of scope.
+      - The fix would require modifying a package you do not have write
+        access to.
+      - The fix would need prod-side changes (rollback, config push)
+        the loop cannot do.
+      - After 2 fix.rejected rounds on the same issue.
+
+      Default is fix.blocked. Landing a fix requires positive action.
+
+      Constraints:
+      - You MUST NOT fix more than the reported bug.
+      - You MUST NOT skip the regression test.
+      - You MUST NOT refactor unrelated code.
+      - You MUST NOT git push. Local commits only.
+      - You MUST NOT `git commit --amend` unless the package requires
+        single-commit CRs AND you are fixing a rejected prior attempt.
+
+  verifier:
+    name: "Verifier"
+    description: "Confirms the fix eliminates the failure without regressions. Pessimistic."
+    triggers: ["fix.applied"]
+    publishes: ["fix.verified", "fix.rejected"]
+    default_publishes: "fix.rejected"
+    instructions: |
+      Verify the fix actually solves the original problem.
+
+      Checks:
+      1. Re-run the original repro command with the fix applied.
+         It MUST now pass.
+      2. Run the regression test in isolation. It MUST pass.
+      3. Revert the fix locally (`git stash`), re-run the regression
+         test. It MUST fail. This proves the test actually catches
+         the bug. Re-apply the fix (`git stash pop`).
+      4. Run `brazil-build` in the changed package. It MUST pass.
+      5. Run the package's existing test suite. No pre-existing test
+         may newly fail.
+      6. Check the diff for: speculative changes, unrelated refactors,
+         loosened assertions, disabled tests.
+
+      Emit fix.verified ONLY when all six checks pass cleanly.
+
+      Emit fix.rejected when any check fails, or when the diff shows
+      scope creep. Include concrete feedback: which check failed,
+      observed vs expected, line references for scope concerns.
+
+      Default is fix.rejected. Silence means retry.
+
+      Constraints:
+      - You MUST NOT trust "it works on my machine."
+      - You MUST NOT skip the test-actually-fails-without-fix check.
+      - You MUST NOT pass a fix that disables or weakens existing tests.
+
+  gatekeeper:
+    name: "Gatekeeper"
+    description: "Confidence gate. Decides CR vs RCA-only. Defaults to safe (no CR)."
+    triggers: ["fix.verified"]
+    publishes: ["cr.ready", "DEBUG_COMPLETE"]
+    default_publishes: "DEBUG_COMPLETE"
+    instructions: |
+      Decide whether to submit a CR or stop with RCA-only. The safe
+      default is RCA-only.
+
+      Score these dimensions (each 0-3):
+
+      1. Repro fidelity: did the local reproduction match the
+         pipeline failure exactly (same error, same file:line, same
+         stack)? 3 = exact match. 0 = "similar-ish."
+      2. Fix minimality: does the diff change ONLY what's needed for
+         the root cause? 3 = one-line change or tight block.
+         0 = sprawling refactor.
+      3. Test quality: does the regression test genuinely cover the
+         cause (fails without the fix, passes with it, asserts the
+         actual invariant)? 3 = yes. 0 = weak or tautological.
+      4. Blast radius: is the changed package owned by the team
+         running the pipeline? Is it non-prod code path? 3 = yes +
+         non-prod. 0 = cross-team or prod-critical path.
+      5. Side-effect risk: could this break other callers? Is the
+         changed function public API? 3 = internal + narrow.
+         0 = public API with unclear callers.
+
+      Emit cr.ready ONLY when the total score is >=12/15 AND repro
+      fidelity AND fix minimality are BOTH 3. Include the confidence
+      scores in the payload.
+
+      Otherwise call `ralph emit "DEBUG_COMPLETE" "<RCA-only outcome>"`.
+      After that emit, your response MUST end with the literal token
+      `DEBUG_COMPLETE` on its own line as the very last non-empty line.
+      Append the proposed fix to docs/rca-<N>.md under "Proposed Fix
+      (not submitted — low confidence)" with the score breakdown and
+      a note on what would need to change to raise confidence.
+
+      Default is DEBUG_COMPLETE. CR submission requires active
+      decision.
+
+      Constraints:
+      - You MUST NOT emit cr.ready just because the fix technically works.
+      - You MUST NOT weight "the loop worked hard" as a reason to submit.
+      - You MUST NOT submit if you would not approve this CR yourself
+        as a reviewer.
+
+  submitter:
+    name: "Submitter"
+    description: "Creates the CR via CRRevisionCreator. Graceful fallback on failure."
+    triggers: ["cr.ready"]
+    publishes: ["DEBUG_COMPLETE"]
+    default_publishes: "DEBUG_COMPLETE"
+    max_activations: 2
+    backend:
+      type: "kiro-acp"
+      agent: "talon-dev"
+    instructions: |
+      Create the CR. This is the ONLY hat allowed to invoke
+      CRRevisionCreator or git push.
+
+      Process:
+      1. Read the branch + commit SHA from the event payload.
+      2. Verify the workspace is still clean: `git status --porcelain`
+         returns empty.
+      3. If the package requires single-commit CRs: confirm there is
+         exactly one commit on the branch. If not: append to docs/rca-<N>.md
+         "CR Submission Failed: multi-commit-violation" and emit
+         DEBUG_COMPLETE.
+      4. Build a CR description:
+         - Title: short summary of the root cause + fix
+         - Body: Summary / Root Cause (with log citations) / Fix /
+           Testing / Risk (from Gatekeeper's blast radius + side-effect
+           scores)
+         - Reference the original pipeline failure URL from PRD.md
+      5. Call CRRevisionCreator with the branch, package, and
+         description. Capture the CR ID.
+      6. Append the CR ID + URL to docs/rca-<N>.md under "Submitted CR"
+         (on success) or "CR Submission Failed: <reason>" with the full
+         proposed diff (on failure, so a human can submit manually).
+      7. Close all open runtime tasks: `ralph tools task list` →
+         `ralph tools task close <task-id>` for each. Open tasks will
+         cause Ralph to reject DEBUG_COMPLETE and the loop will run to
+         max_iterations.
+      8. Call `ralph emit "DEBUG_COMPLETE" "<CR ID or failure reason>"`.
+         After that emit, your response MUST end with the literal token
+         `DEBUG_COMPLETE` on its own line as the very last non-empty line.
+
+      On any failure (auth, CR tool error, package not in reviewer
+      rules): do not retry — Ralph handles retries via max_activations.
+      Document the failure in docs/rca-<N>.md and call
+      `ralph emit "DEBUG_COMPLETE" "<failure reason>"`, then end your
+      response with `DEBUG_COMPLETE` on its own line so the outer loop
+      surfaces the result.
+
+      Constraints:
+      - You MUST NOT `git push` directly — CRRevisionCreator handles
+        the push as part of CR creation. No hat in this collection
+        may invoke `git push`.
+      - You MUST NOT modify the diff at submission time — submit what
+        Verifier approved.
+      - You MUST NOT submit CRs to packages outside the pipeline's
+        ownership.
+      - You MUST NOT submit without a clear testing section in the
+        description.
