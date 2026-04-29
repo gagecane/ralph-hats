@@ -1,0 +1,393 @@
+#!/usr/bin/env bash
+# remote_ralph — run Ralph loops on the secondary dev desktop (dsk2) to offload
+# CPU + token work from the primary machine.
+#
+# Usage:
+#   remote_ralph push     <loop-name>                        Sync loop dir: primary → dsk2
+#   remote_ralph pull     <loop-name>                        Sync loop dir: dsk2 → primary (results)
+#   remote_ralph launch   <loop-name> <hats> <max-iter>      Push + start ralph in tmux on dsk2
+#   remote_ralph status   [loop-name]                        List ralph tmux sessions on dsk2
+#   remote_ralph log      <loop-name> [tail-N]               Tail .run.log on dsk2 (default 50 lines)
+#   remote_ralph attach   <loop-name>                        Attach to dsk2 tmux session
+#   remote_ralph finish   <loop-name>                        Block until loop exits, then pull
+#   remote_ralph kill     <loop-name>                        Kill the dsk2 tmux session
+#   remote_ralph help                                        Show this help
+#
+# Design notes:
+# - SSH is invoked with `-F ~/.ssh/config` to bypass broken /etc/ssh/ssh_config.d
+#   files (nobody-owned on this host, which can kill unqualified ssh in strict paths).
+# - The `dsk2` alias in ~/.ssh/config handles hostname + ControlMaster multiplexing.
+# - Loop lives at /workplace/canewiw/loops/<name>/ on BOTH hosts (not NFS-shared).
+# - rsync excludes the volatile ralph state files so a re-push doesn't clobber
+#   an in-progress run. Pull brings everything back.
+# - Ralph config + hats live at ~/.ralph/ on both hosts and are already in sync
+#   (shared mtime across hosts); this script does NOT manage them.
+
+set -euo pipefail
+
+# --- constants ---
+DSK2="dsk2"
+SSH_CFG="$HOME/.ssh/config"
+LOOPS_ROOT="/workplace/canewiw/loops"
+RALPH_BIN="\$HOME/.cargo/bin/ralph"    # resolved on the remote side
+HATS_DIR_REMOTE="\$HOME/.ralph/hats"    # resolved on the remote side
+RALPH_CONFIG_REMOTE="\$HOME/.ralph/config.yml"
+
+# --- ssh/rsync helpers ---
+_rr_path='PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"'
+rr_ssh()    { ssh -F "$SSH_CFG" "$DSK2" "$_rr_path; $@"; }
+rr_ssh_t()  { ssh -F "$SSH_CFG" -t "$DSK2" "$_rr_path; $@"; }   # tty attached, for tmux attach
+rr_rsync()  { rsync -e "ssh -F $SSH_CFG" "$@"; }
+
+# --- logging ---
+info() { printf '\033[36m[remote_ralph]\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[33m[remote_ralph]\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[31m[remote_ralph]\033[0m %s\n' "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+# --- arg helpers ---
+require_loop_name() {
+  [ $# -ge 1 ] && [ -n "$1" ] || die "loop name required"
+  # Strict allow-list: lowercase-kebab + digits + dots + underscores.
+  # Anything else (shell metachars, path separators, whitespace) is rejected
+  # because the name is interpolated into remote shell commands.
+  # ALSO reject '.', '..', and any '..' sequence — the name is appended to
+  # $LOOPS_ROOT to form a directory path, so these would traverse out of the
+  # loops root (e.g. 'remote_ralph push ..' would rsync all of /workplace/canewiw/).
+  case "$1" in
+    .|..) die "loop name cannot be '.' or '..'" ;;
+    *..*) die "loop name cannot contain '..' (path traversal): '$1'" ;;
+    *[!a-zA-Z0-9._-]*|'') die "loop name must match [a-zA-Z0-9._-]+: '$1'" ;;
+  esac
+}
+
+require_hat_name() {
+  [ $# -ge 1 ] && [ -n "$1" ] || die "hat collection name required"
+  # Hat names are hat-collection basenames (e.g. 'research', 'code-assist').
+  # Same allow-list as loop names; same dot/dotdot rejection since $hats is
+  # interpolated into '$HATS_DIR_REMOTE/$hats.yml' path.
+  case "$1" in
+    .|..) die "hat name cannot be '.' or '..'" ;;
+    *..*) die "hat name cannot contain '..' (path traversal): '$1'" ;;
+    *[!a-zA-Z0-9._-]*|'') die "hat name must match [a-zA-Z0-9._-]+: '$1'" ;;
+  esac
+}
+
+require_positive_int() {
+  # Usage: require_positive_int <value> <field-name>
+  case "$1" in
+    *[!0-9]*|'') die "$2 must be a positive integer: '$1'" ;;
+    0) die "$2 must be > 0: '$1'" ;;
+  esac
+}
+
+local_loop_dir()  { echo "$LOOPS_ROOT/$1"; }
+remote_loop_dir() { echo "$LOOPS_ROOT/$1"; }
+
+# --- subcommands ---
+
+cmd_help() {
+  sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# Push local loop dir to dsk2. Push is additive: existing excluded files on
+# dsk2 (e.g. .ralph/, .run.log) are NOT deleted, so a re-push during an
+# in-progress run on dsk2 will not clobber ralph's state. Non-excluded files
+# (PRD.md, docs/, etc.) are updated to match local.
+cmd_push() {
+  require_loop_name "$@"
+  local name="$1"
+  local src="$(local_loop_dir "$name")/"
+  local dst="$DSK2:$(remote_loop_dir "$name")/"
+  [ -d "$src" ] || die "local loop dir missing: $src"
+  info "push $name : $src → $dst"
+  rr_ssh "mkdir -p '$(remote_loop_dir "$name")'"
+  # No --delete or --delete-excluded — push is strictly additive.
+  # --delete-excluded was PREVIOUSLY used here and caused .ralph/, .run.log,
+  # and .ralph-exited to be wiped on dsk2 during re-pushes (it deletes
+  # destination files that match the exclude patterns). Do not re-add.
+  rr_rsync -az \
+    --exclude='.ralph/' \
+    --exclude='.run.log' \
+    --exclude='.ralph-exited' \
+    --exclude='.ralph-doctor.log' \
+    --exclude='.ralph-hats-validate.log' \
+    --exclude='.chain.log' \
+    "$src" "$dst"
+  info "push complete"
+}
+
+# Pull results from dsk2 back to primary. Pulls EVERYTHING including ralph state
+# so you can inspect events + logs locally. Uses --update to avoid clobbering
+# newer local files (e.g. if you edited PRD.md here during the run).
+cmd_pull() {
+  require_loop_name "$@"
+  local name="$1"
+  local src="$DSK2:$(remote_loop_dir "$name")/"
+  local dst="$(local_loop_dir "$name")/"
+  rr_ssh "test -d '$(remote_loop_dir "$name")'" || die "remote loop dir missing: $(remote_loop_dir "$name")"
+  mkdir -p "$dst"
+  info "pull $name : $src → $dst"
+  rr_rsync -az --update "$src" "$dst"
+  info "pull complete"
+}
+
+# Launch ralph on dsk2. This is a stripped-down version of
+# ~/.meshclaw/skills/ralph-loop-create/scripts/launch.sh — no callback hook,
+# no chain, no webhook machinery (those are primary-box-only).
+cmd_launch() {
+  [ $# -ge 3 ] || die "usage: remote_ralph launch <loop-name> <hat-collection> <max-iterations>"
+  local name="$1"
+  local hats="$2"
+  local iters="$3"
+  require_loop_name "$name"
+  require_hat_name "$hats"
+  require_positive_int "$iters" "max-iterations"
+
+  local local_dir="$(local_loop_dir "$name")"
+  local remote_dir="$(remote_loop_dir "$name")"
+  [ -d "$local_dir" ] || die "local loop dir missing: $local_dir"
+  [ -f "$local_dir/PRD.md" ] || die "$local_dir/PRD.md missing — ralph loops need a PRD"
+
+  info "launching $name on dsk2 (hats=$hats, iters=$iters)"
+
+  # Step 1: push
+  cmd_push "$name"
+
+  # Step 2: refuse if a tmux session with this name already exists on dsk2
+  if rr_ssh "tmux has-session -t '$name'" 2>/dev/null; then
+    die "tmux session '$name' already exists on dsk2 (kill with: remote_ralph kill $name)"
+  fi
+
+  # Step 3: verify hat file exists on dsk2
+  if ! rr_ssh "test -f \"$HATS_DIR_REMOTE/$hats.yml\""; then
+    rr_ssh "ls \"$HATS_DIR_REMOTE\"/*.yml 2>/dev/null | xargs -n1 basename -s .yml" | sed 's/^/  /' >&2
+    die "hat collection '$hats' not found on dsk2 (~/.ralph/hats/$hats.yml)"
+  fi
+
+  # Step 4: ralph doctor on dsk2
+  info "running ralph doctor on dsk2..."
+  if ! rr_ssh "cd '$remote_dir' && $RALPH_BIN doctor > .ralph-doctor.log 2>&1"; then
+    rr_ssh "tail -20 '$remote_dir/.ralph-doctor.log'" >&2
+    die "ralph doctor failed on dsk2"
+  fi
+  info "  doctor PASS"
+
+  # Step 5: validate hats
+  info "validating hat collection..."
+  if ! rr_ssh "cd '$remote_dir' && $RALPH_BIN hats validate -H '$HATS_DIR_REMOTE/$hats.yml' > .ralph-hats-validate.log 2>&1"; then
+    rr_ssh "tail -20 '$remote_dir/.ralph-hats-validate.log'" >&2
+    die "hat validation failed on dsk2"
+  fi
+  info "  hats PASS"
+
+  # Step 6: resolve RALPH_EVENTS_FILE if this is a resumed loop.
+  # Local launch.sh does this to avoid the 'ralph emit with no RALPH_EVENTS_FILE'
+  # waste pattern. Only fires when .ralph/current-events already exists on dsk2
+  # (i.e. a previous run set up events). First-time launches don't need it —
+  # ralph creates .ralph/ on its own.
+  local events_export=""
+  local events_file
+  events_file=$(rr_ssh "
+    if [ -f '$remote_dir/.ralph/current-events' ]; then
+      _rel=\$(cat '$remote_dir/.ralph/current-events')
+      cd '$remote_dir' && cd \"\$(dirname \"\$_rel\")\" && echo \"\$(pwd)/\$(basename \"\$_rel\")\"
+    fi
+  " 2>/dev/null)
+  if [ -n "$events_file" ]; then
+    info "  resumed loop — exporting RALPH_EVENTS_FILE=$events_file"
+    # quoted to survive the outer double-quoted rr_ssh string below
+    events_export="export RALPH_EVENTS_FILE='$events_file';"
+  fi
+
+  # Step 7: launch ralph in detached tmux session on dsk2
+  # We build the remote command as a single quoted string; Ralph reads PRD.md
+  # from CWD via the -p "$(cat PRD.md)" trick (same as local launch.sh).
+  info "starting tmux session '$name' on dsk2..."
+  # shellcheck disable=SC2016
+  rr_ssh "tmux new-session -d -s '$name' -c '$remote_dir' '
+    set -o pipefail;
+    export PATH=\"\$HOME/.cargo/bin:\$HOME/.local/share/mise/shims:\$HOME/.local/bin:\$HOME/.toolbox/bin:\$PATH\";
+    export RALPH_CONFIG=$RALPH_CONFIG_REMOTE;
+    $events_export
+    $RALPH_BIN run -H $HATS_DIR_REMOTE/$hats.yml -p \"\$(cat PRD.md)\" --max-iterations $iters 2>&1 | tee -a .run.log;
+    rc=\$?;
+    echo \"ralph-exited-\$(date +%s)-rc\$rc\" > .ralph-exited;
+    true
+  '"
+
+  # Step 8: give ralph a chance to start, then sanity-check.
+  # 5s instead of 2s because tmux + ralph startup + config parse + doctor-equivalent
+  # can easily eat 3+ seconds on a loaded machine.
+  sleep 5
+  if ! rr_ssh "tmux has-session -t '$name'"; then
+    warn "tmux session not running — ralph likely failed fast"
+    rr_ssh "tail -30 '$remote_dir/.run.log' 2>/dev/null" >&2 || true
+    die "tmux session failed to start on dsk2"
+  fi
+
+  info "✓ launched"
+  echo ""
+  echo "  loop:       $name"
+  echo "  host:       dsk2"
+  echo "  remote dir: $remote_dir"
+  echo "  tmux:       $name"
+  echo "  hats:       $hats"
+  echo "  iterations: $iters"
+  echo ""
+  echo "  attach:     remote_ralph attach $name"
+  echo "  tail log:   remote_ralph log $name"
+  echo "  status:     remote_ralph status $name"
+  echo "  pull back:  remote_ralph pull $name   (after completion)"
+  echo "  finish:     remote_ralph finish $name (blocks until done, auto-pulls)"
+}
+
+# List tmux sessions on dsk2 that look like ralph loops (any session whose
+# CWD is under $LOOPS_ROOT). With a name arg, show details for that loop.
+cmd_status() {
+  if [ $# -eq 0 ]; then
+    info "dsk2: ralph loop sessions"
+    # Use | as delimiter (invalid in paths, survives nested shell escaping better than \t)
+    rr_ssh "tmux list-sessions -F '#{session_name}|#{session_created}|#{pane_current_path}' 2>/dev/null | awk -F'|' -v root='$LOOPS_ROOT' '\$3 ~ root { printf \"  %-40s  created=%s  cwd=%s\\n\", \$1, strftime(\"%Y-%m-%d %H:%M:%S\", \$2), \$3 }'" \
+      || echo "  (none)"
+    echo ""
+    info "dsk2: loops with .ralph-exited marker (finished)"
+    rr_ssh "for d in '$LOOPS_ROOT'/*/; do
+      if [ -f \"\$d/.ralph-exited\" ]; then
+        name=\$(basename \"\$d\")
+        marker=\$(cat \"\$d/.ralph-exited\" 2>/dev/null | head -1)
+        printf '  %-40s  %s\\n' \"\$name\" \"\$marker\"
+      fi
+    done | head -20"
+  else
+    local name="$1"
+    require_loop_name "$name"
+    local remote_dir="$(remote_loop_dir "$name")"
+    info "dsk2: status for $name"
+    rr_ssh "
+      echo '  remote dir: $remote_dir'
+      if [ -d '$remote_dir' ]; then
+        echo '  exists:     yes'
+        if tmux has-session -t '$name' 2>/dev/null; then
+          created=\$(tmux display-message -p -t '$name' '#{session_created}' 2>/dev/null)
+          [ -n \"\$created\" ] && echo \"  tmux:       running (started \$(date -d @\$created +%Y-%m-%d\\ %H:%M:%S))\"
+        else
+          echo '  tmux:       (no session — already exited or never started)'
+        fi
+        if [ -f '$remote_dir/.ralph-exited' ]; then
+          echo \"  exited:     \$(cat '$remote_dir/.ralph-exited' | head -1)\"
+        fi
+        if [ -f '$remote_dir/.run.log' ]; then
+          size=\$(stat -c %s '$remote_dir/.run.log' 2>/dev/null)
+          echo \"  log size:   \$size bytes\"
+        fi
+        if [ -d '$remote_dir/docs' ]; then
+          echo '  docs:'
+          ls '$remote_dir/docs' | sed 's/^/    /'
+        fi
+      else
+        echo '  exists:     NO'
+      fi
+    "
+  fi
+}
+
+cmd_log() {
+  require_loop_name "$@"
+  local name="$1"; shift || true
+  local n="${1:-50}"
+  require_positive_int "$n" "tail line count"
+  local remote_dir="$(remote_loop_dir "$name")"
+  rr_ssh "tail -n $n '$remote_dir/.run.log' 2>/dev/null" || die "no .run.log on dsk2 for $name"
+}
+
+cmd_attach() {
+  require_loop_name "$@"
+  local name="$1"
+  rr_ssh "tmux has-session -t '$name'" || die "no tmux session '$name' on dsk2"
+  info "attaching to '$name' on dsk2 (detach: Ctrl-b d)"
+  rr_ssh_t "tmux attach -t '$name'"
+}
+
+cmd_kill() {
+  require_loop_name "$@"
+  local name="$1"
+  if rr_ssh "tmux has-session -t '$name'" 2>/dev/null; then
+    rr_ssh "tmux kill-session -t '$name'"
+    info "killed tmux session '$name' on dsk2"
+  else
+    warn "no tmux session '$name' on dsk2 (already gone)"
+  fi
+}
+
+# Block (poll every 30s) until the tmux session disappears on dsk2, then pull.
+# SSH exit codes distinguished:
+#   0   → session exists (keep polling)
+#   1   → session not found → done (break)
+#   255 → SSH/network error → retry once, then break on repeat
+#   *   → other error → break (same as "done")
+cmd_finish() {
+  require_loop_name "$@"
+  local name="$1"
+  # Verify the session exists at least once before polling, so typos fail fast.
+  if ! rr_ssh "tmux has-session -t '$name'" 2>/dev/null; then
+    die "no tmux session '$name' on dsk2 — nothing to wait for"
+  fi
+  info "waiting for '$name' to finish on dsk2 (polling every 30s; Ctrl-C to abort)"
+  local waited=0
+  local ssh_failures=0
+  while true; do
+    local rc=0
+    rr_ssh "tmux has-session -t '$name'" >/dev/null 2>&1 || rc=$?
+    case $rc in
+      0)
+        ssh_failures=0
+        ;;
+      1)
+        info "session ended cleanly"
+        break
+        ;;
+      255)
+        ssh_failures=$((ssh_failures + 1))
+        if [ $ssh_failures -ge 2 ]; then
+          warn "ssh to dsk2 failed twice in a row — giving up polling"
+          break
+        fi
+        warn "ssh hiccup (rc=255), will retry in 30s"
+        ;;
+      *)
+        warn "unexpected ssh/tmux rc=$rc — treating as session-ended"
+        break
+        ;;
+    esac
+    sleep 30
+    waited=$((waited + 30))
+    if [ $((waited % 300)) -eq 0 ]; then
+      info "still running... waited ${waited}s"
+    fi
+  done
+  info "tmux session gone after ${waited}s — pulling results"
+  # cmd_pull calls die() on failure, which exits the whole script — there's
+  # no point wrapping this in `if !`, the branch is unreachable. If the pull
+  # fails, the user sees the die message and can re-run `remote_ralph pull`
+  # once dsk2 is reachable again.
+  cmd_pull "$name"
+  local marker
+  marker=$(cat "$(local_loop_dir "$name")/.ralph-exited" 2>/dev/null | head -1 || true)
+  [ -n "$marker" ] && info "exit marker: $marker"
+}
+
+# --- dispatch ---
+sub="${1:-help}"; shift || true
+case "$sub" in
+  help|-h|--help) cmd_help ;;
+  push)    cmd_push "$@" ;;
+  pull)    cmd_pull "$@" ;;
+  launch)  cmd_launch "$@" ;;
+  status)  cmd_status "$@" ;;
+  log)     cmd_log "$@" ;;
+  attach)  cmd_attach "$@" ;;
+  kill)    cmd_kill "$@" ;;
+  finish)  cmd_finish "$@" ;;
+  *) err "unknown subcommand: $sub"; cmd_help; exit 2 ;;
+esac
